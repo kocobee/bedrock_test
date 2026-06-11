@@ -1,11 +1,13 @@
-import anthropic
+import os
 import json
+import httpx
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = anthropic.Anthropic()
-MODEL = "claude-opus-4-8"
+MODEL = "us.anthropic.claude-opus-4-8-20251101-v1:0"
+USE_MOCK = os.getenv("USE_MOCK", "false").lower() == "true"
 
 SYSTEM_PROMPT = """You are a helpful customer support agent for Acme Corp. You assist customers with:
 - Order status and tracking
@@ -80,11 +82,62 @@ tools = [
 ]
 
 
+class _BedrockMockTransport(httpx.BaseTransport):
+    """Intercepts Bedrock HTTP requests and returns a canned Anthropic-format response."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            body = json.loads(request.content)
+            messages = body.get("messages", [])
+            last = messages[-1]["content"] if messages else ""
+            if isinstance(last, list):
+                last_text = " ".join(b.get("text", "") for b in last if b.get("type") == "text")
+            else:
+                last_text = str(last)
+        except Exception:
+            last_text = ""
+
+        last_lower = last_text.lower()
+        if "order" in last_lower:
+            text = "[MOCK BEDROCK] I can help with your order. Please share the order ID."
+        elif "return" in last_lower or "refund" in last_lower:
+            text = "[MOCK BEDROCK] I can help with a return. Please provide your order ID and reason."
+        else:
+            text = "[MOCK BEDROCK] Hello! I'm the Acme Corp support agent. How can I help you today?"
+
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_mock_bedrock",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "model": MODEL,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": len(text.split())},
+            },
+        )
+
+
+def _make_client() -> anthropic.AnthropicBedrock:
+    if USE_MOCK:
+        return anthropic.AnthropicBedrock(
+            aws_access_key="mock-key",
+            aws_secret_key="mock-secret",
+            aws_region="us-east-1",
+            http_client=httpx.Client(transport=_BedrockMockTransport()),
+        )
+    return anthropic.AnthropicBedrock()
+
+
+client = _make_client()
+
+
 def handle_tool_call(tool_name: str, tool_input: dict) -> str:
     """Simulate tool execution — replace with real integrations."""
     if tool_name == "get_order_status":
         order_id = tool_input["order_id"]
-        # Simulated response
         return json.dumps({
             "order_id": order_id,
             "status": "shipped",
@@ -137,12 +190,10 @@ def run_agent(conversation_history: list[dict]) -> str:
             messages=messages,
         )
 
-        # Collect assistant content
         assistant_content = response.content
         messages.append({"role": "assistant", "content": assistant_content})
 
         if response.stop_reason == "end_turn":
-            # Extract text from content blocks
             for block in assistant_content:
                 if block.type == "text":
                     return block.text
@@ -163,7 +214,6 @@ def run_agent(conversation_history: list[dict]) -> str:
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Unexpected stop reason
         break
 
     return ""
