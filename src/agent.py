@@ -1,12 +1,15 @@
 import os
+import io
 import json
-import httpx
-import anthropic
+import boto3
 from dotenv import load_dotenv
 
 load_dotenv()
 
 MODEL = "us.anthropic.claude-opus-4-8-20251101-v1:0"
+# Bedrock's native InvokeModel API takes the Anthropic Messages body verbatim,
+# minus ``model``, plus this ``anthropic_version`` discriminator in the body.
+ANTHROPIC_VERSION = "bedrock-2023-05-31"
 USE_MOCK = os.getenv("USE_MOCK", "false").lower() == "true"
 
 SYSTEM_PROMPT = """You are a helpful customer support agent for Acme Corp. You assist customers with:
@@ -82,13 +85,16 @@ tools = [
 ]
 
 
-class _BedrockMockTransport(httpx.BaseTransport):
-    """Intercepts Bedrock HTTP requests and returns a canned Anthropic-format response."""
+class _MockBedrockRuntime:
+    """Stands in for a boto3 ``bedrock-runtime`` client, returning canned
+    Anthropic-format responses so runs work with ``USE_MOCK=true`` and no AWS
+    credentials. Mirrors the real client's ``invoke_model`` contract: takes a
+    JSON ``body`` and returns ``{"body": <stream with .read()>}``."""
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+    def invoke_model(self, *, modelId: str, body: str, **kwargs) -> dict:
         try:
-            body = json.loads(request.content)
-            messages = body.get("messages", [])
+            parsed = json.loads(body)
+            messages = parsed.get("messages", [])
             last = messages[-1]["content"] if messages else ""
             if isinstance(last, list):
                 last_text = " ".join(b.get("text", "") for b in last if b.get("type") == "text")
@@ -105,33 +111,47 @@ class _BedrockMockTransport(httpx.BaseTransport):
         else:
             text = "[MOCK BEDROCK] Hello! I'm the Acme Corp support agent. How can I help you today?"
 
-        return httpx.Response(
-            200,
-            json={
-                "id": "msg_mock_bedrock",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": text}],
-                "model": MODEL,
-                "stop_reason": "end_turn",
-                "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": len(text.split())},
-            },
-        )
+        payload = {
+            "id": "msg_mock_bedrock",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": modelId,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": len(text.split())},
+        }
+        return {"body": io.BytesIO(json.dumps(payload).encode())}
 
 
-def _make_client() -> anthropic.AnthropicBedrock:
+def _make_client():
     if USE_MOCK:
-        return anthropic.AnthropicBedrock(
-            aws_access_key="mock-key",
-            aws_secret_key="mock-secret",
-            aws_region="us-east-1",
-            http_client=httpx.Client(transport=_BedrockMockTransport()),
-        )
-    return anthropic.AnthropicBedrock()
+        return _MockBedrockRuntime()
+    return boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
 
 
 client = _make_client()
+
+
+def invoke_model(messages: list[dict], *, model: str = MODEL, max_tokens: int = 4096,
+                 system: str | None = None, tools: list | None = None,
+                 thinking: dict | None = None) -> dict:
+    """Call Bedrock's InvokeModel with an Anthropic Messages body and return the
+    parsed response dict. The single seam where we hand messages to Bedrock."""
+    body = {
+        "anthropic_version": ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if system:
+        body["system"] = system
+    if tools:
+        body["tools"] = tools
+    if thinking:
+        body["thinking"] = thinking
+
+    response = client.invoke_model(modelId=model, body=json.dumps(body))
+    return json.loads(response["body"].read())
 
 
 def handle_tool_call(tool_name: str, tool_input: dict) -> str:
@@ -181,33 +201,31 @@ def run_agent(conversation_history: list[dict]) -> str:
     messages = conversation_history.copy()
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            thinking={"type": "adaptive"},
+        response = invoke_model(
+            messages,
             system=SYSTEM_PROMPT,
             tools=tools,
-            messages=messages,
+            thinking={"type": "adaptive"},
         )
 
-        assistant_content = response.content
+        assistant_content = response["content"]
         messages.append({"role": "assistant", "content": assistant_content})
 
-        if response.stop_reason == "end_turn":
+        if response["stop_reason"] == "end_turn":
             for block in assistant_content:
-                if block.type == "text":
-                    return block.text
+                if block["type"] == "text":
+                    return block["text"]
             return ""
 
-        if response.stop_reason == "tool_use":
+        if response["stop_reason"] == "tool_use":
             tool_results = []
             for block in assistant_content:
-                if block.type == "tool_use":
-                    print(f"  [tool: {block.name}({json.dumps(block.input)})]")
-                    result = handle_tool_call(block.name, block.input)
+                if block["type"] == "tool_use":
+                    print(f"  [tool: {block['name']}({json.dumps(block['input'])})]")
+                    result = handle_tool_call(block["name"], block["input"])
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "tool_use_id": block["id"],
                         "content": result,
                     })
 
